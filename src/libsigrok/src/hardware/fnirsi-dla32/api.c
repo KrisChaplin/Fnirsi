@@ -42,6 +42,8 @@
 /* Minimum silence before giving up on the end of a Buffer upload. */
 #define UPLOAD_TAIL_USEC (200 * 1000)
 #define BUFFER_SKIP_BYTES 4096
+/* Re-arm once if no data arrives this long after the capture should end. */
+#define REARM_USEC G_TIME_SPAN_SECOND
 
 #include "transport-wch.h"
 
@@ -63,6 +65,9 @@ struct dev_context {
 	gboolean stream, continuous, usb3, logic_only;
 	gboolean upload_tail;
 	size_t skip_bytes;
+	uint8_t setup_cmd[DLA_COMMAND_SIZE], arm_cmd[DLA_COMMAND_SIZE];
+	gboolean rearmed;
+	int64_t rearm_after_us;
 	struct pwm_setting pwm[4];
 	struct dla_decoder decoder;
 	uint32_t channel_mask;
@@ -869,8 +874,29 @@ static void note_data_progress(struct dev_context *devc)
 	devc->last_data_us = g_get_monotonic_time();
 }
 
-static void check_data_progress(struct dev_context *devc)
+/* The device occasionally ignores SETUP/ARM and then applies the stale
+ * SETUP to the next acquisition. Stop and resend both once. */
+static void rearm_acquisition(const struct sr_dev_inst *sdi)
 {
+	struct dev_context *devc = sdi->priv;
+	uint8_t packet[DLA_COMMAND_SIZE];
+
+	sr_warn("No data from the device; re-arming the acquisition.");
+	devc->rearmed = TRUE;
+	dla_stop(packet);
+	if (send_command(sdi, packet) == SR_OK)
+		read_stop_reply(sdi);
+	g_usleep(STOP_SETTLE_USEC);
+	if (send_command(sdi, devc->setup_cmd) == SR_OK) {
+		g_usleep(SETUP_ARM_USEC);
+		send_command(sdi, devc->arm_cmd);
+	}
+	devc->last_data_us = g_get_monotonic_time();
+}
+
+static void check_data_progress(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
 	int64_t timeout;
 
 	if (devc->stopping || (!devc->data_started && devc->has_trigger))
@@ -882,6 +908,11 @@ static void check_data_progress(struct dev_context *devc)
 			G_USEC_PER_SEC / devc->samplerate;
 		if (g_get_monotonic_time() - devc->last_data_us > MAX(UPLOAD_TAIL_USEC, 2 * fill_us))
 			request_stop(devc);
+		return;
+	}
+	if (!devc->limits.samples_read && !devc->stream && !devc->rearmed &&
+			g_get_monotonic_time() - devc->last_data_us > devc->rearm_after_us) {
+		rearm_acquisition(sdi);
 		return;
 	}
 	timeout = devc->data_started ? DATA_STALL_USEC : devc->first_data_timeout_us;
@@ -1140,7 +1171,7 @@ static int receive_events(int fd, int revents, void *cb_data)
 			if (!count)
 				break;
 		}
-		check_data_progress(devc);
+		check_data_progress(sdi);
 		begin_ordered_stop(sdi);
 		if (devc->stopping) {
 			drain_stopped_endpoint(sdi);
@@ -1155,7 +1186,7 @@ static int receive_events(int fd, int revents, void *cb_data)
 		sr_err("Failed to service USB events: %s.", libusb_error_name(ret));
 		request_stop(devc);
 	}
-	check_data_progress(devc);
+	check_data_progress(sdi);
 	begin_ordered_stop(sdi);
 	if (devc->stopping && devc->stop_sent && !devc->submitted_transfers) {
 		drain_stopped_endpoint(sdi);
@@ -1430,6 +1461,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 
 	configure_setup(&setup, devc, samples, has_trigger);
 	dla_setup_configure(packet, &setup);
+	memcpy(devc->setup_cmd, packet, DLA_COMMAND_SIZE);
 	if (send_command(sdi, packet) != SR_OK) {
 		free_prepared_transfers(devc);
 		return SR_ERR_IO;
@@ -1497,6 +1529,9 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		rollback_acquisition((struct sr_dev_inst *)sdi);
 		return ret;
 	}
+	memcpy(devc->arm_cmd, packet, DLA_COMMAND_SIZE);
+	devc->rearmed = FALSE;
+	devc->rearm_after_us = (int64_t)first_data_msec * 1000 + REARM_USEC;
 	devc->last_data_us = g_get_monotonic_time();
 	devc->starting = FALSE;
 	return SR_OK;
