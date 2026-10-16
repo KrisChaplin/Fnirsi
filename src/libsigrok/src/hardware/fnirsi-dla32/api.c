@@ -26,6 +26,9 @@
 #define BUFFER_MEMORY_BITS (UINT64_C(4) * 1024 * 1024 * 1024)
 #define DEFAULT_LIMIT_SAMPLES 50000
 #define LOGIC_ONLY_MAX_LIMIT_SAMPLES UINT64_C(100000000)
+/* Stream has no memory limit, but frontends build sample-count lists up to
+ * the advertised maximum (PulseView loops forever on UINT64_MAX). */
+#define STREAM_MAX_LIMIT_SAMPLES UINT64_C(1000000000000)
 #define CONTINUOUS_WINDOW_MSEC 1000
 #define STOP_DRAIN_USEC (3 * G_TIME_SPAN_SECOND)
 #define STOP_DRAIN_BYTES (UINT64_C(64) * 1024 * 1024)
@@ -107,7 +110,7 @@ static const uint32_t devopts[] = {
 	SR_CONF_LIMIT_MSEC | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_VOLTAGE_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
-	SR_CONF_DEVICE_MODE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_CONTINUOUS | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
 	SR_CONF_CONN | SR_CONF_GET,
@@ -197,7 +200,7 @@ static uint64_t maximum_samples(const struct dev_context *devc,
 	struct dla_decoder decoder;
 
 	if (devc->stream)
-		return UINT64_MAX;
+		return STREAM_MAX_LIMIT_SAMPLES;
 	if (dla_decoder_init(&decoder, mask, FALSE) < 0)
 		return 0;
 	return BUFFER_MEMORY_BITS / decoder.wire_channels;
