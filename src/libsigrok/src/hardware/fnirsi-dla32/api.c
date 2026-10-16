@@ -71,6 +71,10 @@ struct dev_context {
 	size_t skip_bytes;
 	uint8_t setup_cmd[DLA_COMMAND_SIZE], arm_cmd[DLA_COMMAND_SIZE];
 	gboolean rearmed, have_history, last_stream;
+	/* Trigger marker placement (Buffer mode). */
+	unsigned int trig_ch, trig_cond;
+	gboolean trig_sent, trig_prev;
+	int64_t trig_expect, trig_window, trig_best;
 	int64_t rearm_after_us;
 	struct pwm_setting pwm[4];
 	struct dla_decoder decoder;
@@ -945,14 +949,74 @@ static int resubmit_transfer(struct libusb_transfer *transfer)
 	return SR_ERR_IO;
 }
 
-static uint64_t decode_transfer(struct sr_dev_inst *sdi,
-	const uint8_t *input, size_t length)
+static gboolean sample_bit(const struct dev_context *devc, uint64_t i)
+{
+	unsigned int ch = devc->trig_ch;
+
+	return (devc->decoded[i * devc->decoder.unitsize + ch / 8] >> (ch % 8)) & 1;
+}
+
+/* The device places the trigger at a fixed fraction of its capture, but
+ * the stale lead-in that is skipped varies, so the exact sample moves by a
+ * few hundred samples. Find the matching transition closest to the
+ * expected position. Returns its index within this chunk, or -1. */
+static int64_t locate_trigger(struct dev_context *devc, uint64_t first,
+	uint64_t count)
+{
+	int64_t lo = devc->trig_expect - devc->trig_window;
+	int64_t hi = devc->trig_expect + devc->trig_window;
+	int64_t g, at;
+	uint64_t i;
+	gboolean cur, prev = devc->trig_prev, match;
+
+	for (i = 0; i < count; i++, prev = cur) {
+		cur = sample_bit(devc, i);
+		g = first + i;
+		if (g < lo || g > hi)
+			continue;
+		/* Level triggers can fire without an edge; they use the
+		 * expected position. */
+		switch (devc->trig_cond) {
+		case 1: match = !prev && cur; break;	/* rising */
+		case 3: match = prev && !cur; break;	/* falling */
+		case 5: match = prev != cur; break;	/* either edge */
+		default: match = FALSE; break;
+		}
+		if (match && (devc->trig_best < 0 ||
+				ABS(g - devc->trig_expect) < ABS(devc->trig_best - devc->trig_expect)))
+			devc->trig_best = g;
+	}
+	devc->trig_prev = count ? sample_bit(devc, count - 1) : devc->trig_prev;
+	if ((int64_t)(first + count) <= hi)
+		return -1;
+	at = (devc->trig_best >= 0 ? devc->trig_best : devc->trig_expect) - first;
+	return CLAMP(at, 0, (int64_t)count);
+}
+
+static int send_logic(struct sr_dev_inst *sdi, uint64_t offset, uint64_t count)
 {
 	struct dev_context *devc = sdi->priv;
 	struct sr_datafeed_logic logic;
 	struct sr_datafeed_packet packet;
+
+	if (!count)
+		return SR_OK;
+	logic.length = count * devc->decoder.unitsize;
+	logic.unitsize = devc->decoder.unitsize;
+	logic.data = devc->decoded + offset * devc->decoder.unitsize;
+	packet.type = SR_DF_LOGIC;
+	packet.payload = &logic;
+	return sr_session_send(sdi, &packet);
+}
+
+static uint64_t decode_transfer(struct sr_dev_inst *sdi,
+	const uint8_t *input, size_t length)
+{
+	struct dev_context *devc = sdi->priv;
+	struct sr_datafeed_packet packet;
 	size_t produced;
-	uint64_t samples, remaining;
+	uint64_t samples, remaining, split;
+	int64_t at = -1;
 	int ret;
 
 	if (devc->skip_bytes) {
@@ -979,12 +1043,21 @@ static uint64_t decode_transfer(struct sr_dev_inst *sdi,
 	}
 	if (!samples)
 		return 0;
-	logic.length = samples * devc->decoder.unitsize;
-	logic.unitsize = devc->decoder.unitsize;
-	logic.data = devc->decoded;
-	packet.type = SR_DF_LOGIC;
-	packet.payload = &logic;
-	ret = sr_session_send(sdi, &packet);
+	split = samples;
+	if (devc->has_trigger && !devc->stream && !devc->trig_sent) {
+		at = locate_trigger(devc, devc->limits.samples_read, samples);
+		if (at >= 0)
+			split = at;
+	}
+	ret = send_logic(sdi, 0, split);
+	if (ret == SR_OK && at >= 0) {
+		devc->trig_sent = TRUE;
+		packet.type = SR_DF_TRIGGER;
+		packet.payload = NULL;
+		ret = sr_session_send(sdi, &packet);
+	}
+	if (ret == SR_OK)
+		ret = send_logic(sdi, split, samples - split);
 	if (ret != SR_OK) {
 		sr_err("Failed to deliver acquisition samples: %s.", sr_strerror(ret));
 		request_stop(devc);
@@ -1248,6 +1321,8 @@ static int prepare_trigger(const struct sr_dev_inst *sdi,
 		return SR_ERR_NA;
 	}
 	conditions[match->channel->index] = condition;
+	((struct dev_context *)sdi->priv)->trig_ch = match->channel->index;
+	((struct dev_context *)sdi->priv)->trig_cond = condition;
 	return SR_OK;
 }
 
@@ -1487,6 +1562,13 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->data_started = FALSE;
 	devc->upload_tail = FALSE;
 	devc->has_trigger = has_trigger;
+	devc->trig_sent = devc->trig_prev = FALSE;
+	devc->trig_best = -1;
+	/* Expected trigger sample after the skipped lead-in; the stale part
+	 * of the lead-in is 0-3 KiB, so centre on 1.5 KiB. */
+	devc->trig_expect = (int64_t)(samples * setup.trigger_position / 1000) -
+		(int64_t)(BUFFER_SKIP_BYTES - 1536) * 8 / devc->decoder.wire_channels;
+	devc->trig_window = (int64_t)2048 * 8 / devc->decoder.wire_channels;
 	first_data_msec = devc->stream ? 0 :
 		samples_to_milliseconds(samples, devc->samplerate);
 	devc->first_data_timeout_us = first_data_msec >
