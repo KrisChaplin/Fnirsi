@@ -108,9 +108,13 @@ static const int32_t trigger_matches[] = {
 	SR_TRIGGER_FALLING, SR_TRIGGER_EDGE,
 };
 
+/* PWM outputs are hidden by default (logic-only profile). Set SR_DLA32_PWM=1
+ * to expose PWM0..PWM3 channel groups, e.g. for loopback testing. */
 static gboolean logic_only_profile(void)
 {
-	return TRUE;
+	const char *pwm = g_getenv("SR_DLA32_PWM");
+
+	return !(pwm && *pwm && strcmp(pwm, "0"));
 }
 
 static uint32_t enabled_channel_mask(const struct sr_dev_inst *sdi)
