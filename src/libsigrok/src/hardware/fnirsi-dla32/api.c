@@ -27,6 +27,18 @@
 #define STOP_DRAIN_USEC (3 * G_TIME_SPAN_SECOND)
 #define STOP_DRAIN_BYTES (UINT64_C(64) * 1024 * 1024)
 #define STOP_EMPTY_READS 2
+/* After STOP the device ignores a SETUP sent within ~60 ms, and a capture
+ * armed within ~400 ms may start with samples left over from the previous
+ * one (seen after sample rate changes). */
+#define STOP_SETTLE_USEC (800 * 1000)
+/* Switching between Buffer and Stream needs longer. Also used for the first
+ * acquisition, when the previous mode is unknown. */
+#define MODE_SETTLE_USEC (2 * G_TIME_SPAN_SECOND)
+/* Delay between SETUP and ARM used by the vendor application. */
+#define SETUP_ARM_USEC (100 * 1000)
+#define SETUP_REPEAT_USEC (20 * 1000)
+#define STOP_REPLY_SIZE 512
+#define STOP_REPLY_TIMEOUT_MS 250
 #define DATA_STALL_USEC (3 * G_TIME_SPAN_SECOND)
 
 #include "transport-wch.h"
@@ -47,6 +59,7 @@ struct dev_context {
 	uint64_t samplerate;
 	int threshold;
 	gboolean stream, continuous, usb3, logic_only;
+	gboolean have_history, last_stream;
 	struct pwm_setting pwm[4];
 	struct dla_decoder decoder;
 	uint32_t channel_mask;
@@ -396,6 +409,28 @@ static int send_command(const struct sr_dev_inst *sdi, const uint8_t *packet)
 		return SR_ERR_IO;
 	}
 	return SR_OK;
+}
+
+/* The device answers STOP with a 512-byte status block on EP 0x82. The vendor
+ * application always reads it; leaving it unread makes later acquisitions
+ * stall and can wedge the firmware.
+ */
+static void read_stop_reply(const struct sr_dev_inst *sdi)
+{
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	uint8_t reply[STOP_REPLY_SIZE];
+	int count = 0, ret;
+
+#ifdef _WIN32
+	if (((struct dev_context *)sdi->priv)->use_wch)
+		return;
+#endif
+	ret = libusb_bulk_transfer(usb->devhdl, 0x82, reply, sizeof(reply),
+		&count, STOP_REPLY_TIMEOUT_MS);
+	if (ret)
+		sr_warn("No STOP reply: %s.", libusb_error_name(ret));
+	else
+		sr_dbg("STOP reply: %d bytes.", count);
 }
 
 static int send_pwm_config(const struct sr_dev_inst *sdi, unsigned int index,
@@ -775,6 +810,8 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	devc->submitted_transfers = 0;
 	devc->pending = 0;
 	devc->run_limit_samples = 0;
+	devc->have_history = TRUE;
+	devc->last_stream = devc->stream;
 	devc->acquiring = FALSE;
 	devc->starting = FALSE;
 	devc->stopping = FALSE;
@@ -995,6 +1032,8 @@ static void begin_ordered_stop(const struct sr_dev_inst *sdi)
 	devc->stop_sent = TRUE;
 	if (send_command(sdi, packet) != SR_OK)
 		sr_err("Failed to send the acquisition stop command.");
+	else
+		read_stop_reply(sdi);
 }
 
 static void rollback_acquisition(struct sr_dev_inst *sdi)
@@ -1203,7 +1242,7 @@ static void configure_setup(struct dla_setup_config *setup,
 	setup->samplerate_index = samplerate_index(devc->samplerate);
 	setup->threshold = threshold_cv[devc->threshold];
 	setup->threshold_range = threshold_range[devc->threshold];
-	setup->interval_ms = 3;
+	setup->interval_ms = 1;
 	setup->buffer = !devc->stream;
 	setup->mode = devc->continuous ? 3 : 0;
 	if (devc->continuous) {
@@ -1218,12 +1257,7 @@ static void configure_setup(struct dla_setup_config *setup,
 	}
 	setup->duration_ms = MIN(milliseconds, UINT16_MAX);
 	setup->duration_index = duration_index(milliseconds);
-	setup->trigger_position = has_trigger ? 500 : 0;
-}
-
-static void wait_before_arm(gboolean legacy_path)
-{
-	g_usleep(legacy_path ? 10000 : 100000);
+	setup->trigger_position = has_trigger ? 500 : 10;
 }
 
 static int prepare_transfers(struct sr_dev_inst *sdi)
@@ -1276,7 +1310,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	uint32_t mask;
 	int count, ret, i;
 	int64_t drain_deadline;
-	gboolean has_trigger, legacy_path;
+	gboolean has_trigger, stale = FALSE;
 
 	if (devc->acquiring || devc->source_added || devc->submitted_transfers)
 		return SR_ERR;
@@ -1308,19 +1342,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		return SR_ERR_ARG;
 	devc->channel_mask = mask;
 	devc->run_limit_samples = devc->continuous ? 0 : samples;
-	legacy_path = !devc->stream && mask == UINT32_MAX &&
-		devc->samplerate == SR_MHZ(50) && !has_trigger &&
-		!devc->limits.limit_msec && samples <= 500000;
 	ret = prepare_transfers((struct sr_dev_inst *)sdi);
 	if (ret != SR_OK)
 		return ret;
 
-	/* Stop and drain stale data before arming the new asynchronous queue. */
-	dla_stop(packet);
-	if (send_command(sdi, packet) != SR_OK) {
-		free_prepared_transfers(devc);
-		return SR_ERR_IO;
-	}
+	/* Drain stale data before arming the new asynchronous queue. */
 	drain_deadline = g_get_monotonic_time() + STOP_DRAIN_USEC;
 	for (i = 0; i < 64; i++) {
 		count = 0;
@@ -1332,6 +1358,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		sr_dbg("Pre-arm drain %d: status %d, %d bytes.", i, ret, count);
 		if ((ret == LIBUSB_SUCCESS || ret == LIBUSB_ERROR_TIMEOUT) && !count)
 			break;
+		stale = TRUE;
 		if (ret && ret != LIBUSB_ERROR_TIMEOUT) {
 			free_prepared_transfers(devc);
 			return SR_ERR_IO;
@@ -1348,18 +1375,31 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		return SR_ERR_IO;
 	}
 
-	if (legacy_path)
-		dla_setup(packet, ((const uint16_t[]) { 60, 160, 250 })[devc->threshold],
-			((const uint8_t[]) { 7, 2, 1 })[devc->threshold], samples);
-	else {
-		configure_setup(&setup, devc, samples, has_trigger);
-		dla_setup_configure(packet, &setup);
+	/* Only a previous run that was never stopped leaves data behind. */
+	if (stale) {
+		dla_stop(packet);
+		if (send_command(sdi, packet) != SR_OK) {
+			free_prepared_transfers(devc);
+			return SR_ERR_IO;
+		}
+		read_stop_reply(sdi);
 	}
-	if (send_command(sdi, packet) != SR_OK) {
-		free_prepared_transfers(devc);
-		return SR_ERR_IO;
+	g_usleep(devc->have_history && devc->last_stream == devc->stream ?
+		STOP_SETTLE_USEC : MODE_SETTLE_USEC);
+
+	configure_setup(&setup, devc, samples, has_trigger);
+	dla_setup_configure(packet, &setup);
+	/* The device occasionally ignores a SETUP and keeps the previous
+	 * sample rate; sending it twice avoids that. */
+	for (i = 0; i < 2; i++) {
+		if (i)
+			g_usleep(SETUP_REPEAT_USEC);
+		if (send_command(sdi, packet) != SR_OK) {
+			free_prepared_transfers(devc);
+			return SR_ERR_IO;
+		}
 	}
-	wait_before_arm(legacy_path);
+	g_usleep(SETUP_ARM_USEC);
 	devc->usb_ctx = ((struct drv_context *)sdi->driver->context)->sr_ctx;
 	devc->pending = devc->submitted_transfers = 0;
 	devc->stopping = devc->stop_sent = devc->cancel_requested = FALSE;
@@ -1414,13 +1454,8 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->transfer_submitted[i] = TRUE;
 		devc->submitted_transfers++;
 	}
-	if (legacy_path) {
-		dla_channels(packet);
-		ret = send_command(sdi, packet);
-	} else {
-		ret = dla_channels_config(packet, mask, conditions, 0) < 0 ?
-			SR_ERR_ARG : send_command(sdi, packet);
-	}
+	ret = dla_channels_config(packet, mask, conditions, 0) < 0 ?
+		SR_ERR_ARG : send_command(sdi, packet);
 	if (ret != SR_OK) {
 		sr_err("Failed to arm the acquisition: %s.", sr_strerror(ret));
 		rollback_acquisition((struct sr_dev_inst *)sdi);
