@@ -27,6 +27,8 @@
 #define STOP_DRAIN_USEC (3 * G_TIME_SPAN_SECOND)
 #define STOP_DRAIN_BYTES (UINT64_C(64) * 1024 * 1024)
 #define STOP_EMPTY_READS 2
+/* The device ignores SETUP sent too soon after STOP (~30-60 ms observed). */
+#define STOP_SETTLE_USEC (100 * 1000)
 #define DATA_STALL_USEC (3 * G_TIME_SPAN_SECOND)
 
 #include "transport-wch.h"
@@ -1347,6 +1349,8 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		free_prepared_transfers(devc);
 		return SR_ERR_IO;
 	}
+
+	g_usleep(STOP_SETTLE_USEC);
 
 	if (legacy_path)
 		dla_setup(packet, ((const uint16_t[]) { 60, 160, 250 })[devc->threshold],
