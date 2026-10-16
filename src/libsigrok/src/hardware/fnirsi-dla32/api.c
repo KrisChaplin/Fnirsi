@@ -39,7 +39,7 @@
 #define STOP_REPLY_SIZE 512
 #define STOP_REPLY_TIMEOUT_MS 250
 #define DATA_STALL_USEC (3 * G_TIME_SPAN_SECOND)
-/* Give up waiting for the end of a Buffer upload after this much silence. */
+/* Minimum silence before giving up on the end of a Buffer upload. */
 #define UPLOAD_TAIL_USEC (200 * 1000)
 #define BUFFER_SKIP_BYTES 4096
 
@@ -876,7 +876,11 @@ static void check_data_progress(struct dev_context *devc)
 	if (devc->stopping || (!devc->data_started && devc->has_trigger))
 		return;
 	if (devc->upload_tail) {
-		if (g_get_monotonic_time() - devc->last_data_us > UPLOAD_TAIL_USEC)
+		/* At low rates the device uploads at roughly the sample rate, so
+		 * allow twice the time needed to fill one transfer. */
+		int64_t fill_us = (int64_t)(TRANSFER_SIZE * 8 / devc->decoder.wire_channels) *
+			G_USEC_PER_SEC / devc->samplerate;
+		if (g_get_monotonic_time() - devc->last_data_us > MAX(UPLOAD_TAIL_USEC, 2 * fill_us))
 			request_stop(devc);
 		return;
 	}
