@@ -1544,7 +1544,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	g_usleep(devc->have_history && devc->last_stream == devc->stream ?
 		STOP_SETTLE_USEC : MODE_SETTLE_USEC);
 
-	configure_setup(&setup, devc, samples, has_trigger);
+	/* In Buffer mode capture enough extra to cover the skipped lead-in,
+	 * so every delivered sample was actually captured. */
+	configure_setup(&setup, devc, devc->stream ? samples :
+		MIN(samples + BUFFER_SKIP_BYTES * 8 / devc->decoder.wire_channels,
+		maximum), has_trigger);
 	dla_setup_configure(packet, &setup);
 	memcpy(devc->setup_cmd, packet, DLA_COMMAND_SIZE);
 	/* The device occasionally ignores a SETUP and keeps the previous
@@ -1567,11 +1571,12 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->has_trigger = has_trigger;
 	devc->trig_sent = devc->trig_prev = FALSE;
 	devc->trig_best = -1;
-	/* Expected trigger sample after the skipped lead-in; the stale part
-	 * of the lead-in is 0-3 KiB, so centre on 1.5 KiB. */
-	devc->trig_expect = (int64_t)(samples * setup.trigger_position / 1000) -
+	/* Expected trigger sample after the skipped lead-in. The stale part of
+	 * the lead-in is 0-3 KiB, so centre on 1.5 KiB; the WCH path varies
+	 * more, so search up to 4 KiB either side. */
+	devc->trig_expect = (int64_t)(setup.samples * setup.trigger_position / 1000) -
 		(int64_t)(BUFFER_SKIP_BYTES - 1536) * 8 / devc->decoder.wire_channels;
-	devc->trig_window = (int64_t)2048 * 8 / devc->decoder.wire_channels;
+	devc->trig_window = (int64_t)4096 * 8 / devc->decoder.wire_channels;
 	first_data_msec = devc->stream ? 0 :
 		samples_to_milliseconds(samples, devc->samplerate);
 	devc->first_data_timeout_us = first_data_msec >
