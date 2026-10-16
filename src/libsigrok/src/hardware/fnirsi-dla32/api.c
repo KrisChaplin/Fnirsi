@@ -916,7 +916,7 @@ static void check_data_progress(const struct sr_dev_inst *sdi)
 			request_stop(devc);
 		return;
 	}
-	if (!devc->limits.samples_read && !devc->stream && !devc->rearmed &&
+	if (!devc->limits.samples_read && !devc->rearmed &&
 			g_get_monotonic_time() - devc->last_data_us > devc->rearm_after_us) {
 		rearm_acquisition(sdi);
 		return;
