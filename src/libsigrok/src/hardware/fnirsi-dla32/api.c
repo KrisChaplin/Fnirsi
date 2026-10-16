@@ -34,6 +34,9 @@
  * armed within ~400 ms may start with samples left over from the previous
  * one (seen after sample rate changes). */
 #define STOP_SETTLE_USEC (800 * 1000)
+/* Switching between Buffer and Stream needs longer. Also used for the first
+ * acquisition, when the previous mode is unknown. */
+#define MODE_SETTLE_USEC (2 * G_TIME_SPAN_SECOND)
 /* Delay between SETUP and ARM used by the vendor application. */
 #define SETUP_ARM_USEC (100 * 1000)
 #define SETUP_REPEAT_USEC (20 * 1000)
@@ -67,7 +70,7 @@ struct dev_context {
 	gboolean upload_tail;
 	size_t skip_bytes;
 	uint8_t setup_cmd[DLA_COMMAND_SIZE], arm_cmd[DLA_COMMAND_SIZE];
-	gboolean rearmed;
+	gboolean rearmed, have_history, last_stream;
 	int64_t rearm_after_us;
 	struct pwm_setting pwm[4];
 	struct dla_decoder decoder;
@@ -819,6 +822,8 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	devc->submitted_transfers = 0;
 	devc->pending = 0;
 	devc->run_limit_samples = 0;
+	devc->have_history = TRUE;
+	devc->last_stream = devc->stream;
 	devc->acquiring = FALSE;
 	devc->starting = FALSE;
 	devc->stopping = FALSE;
@@ -1458,7 +1463,8 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		}
 		read_stop_reply(sdi);
 	}
-	g_usleep(STOP_SETTLE_USEC);
+	g_usleep(devc->have_history && devc->last_stream == devc->stream ?
+		STOP_SETTLE_USEC : MODE_SETTLE_USEC);
 
 	configure_setup(&setup, devc, samples, has_trigger);
 	dla_setup_configure(packet, &setup);
