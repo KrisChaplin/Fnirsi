@@ -38,6 +38,7 @@
 #define DATA_STALL_USEC (3 * G_TIME_SPAN_SECOND)
 /* Give up waiting for the end of a Buffer upload after this much silence. */
 #define UPLOAD_TAIL_USEC (200 * 1000)
+#define BUFFER_SKIP_BYTES 4096
 
 #include "transport-wch.h"
 
@@ -1369,9 +1370,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		return ret;
 	if (dla_decoder_init(&devc->decoder, mask, devc->stream) < 0)
 		return SR_ERR_ARG;
-	/* The first Buffer frame (8 samples per channel) can hold stale data,
-	 * seen reproducibly at 125 MHz. Drop it. */
-	devc->skip_bytes = devc->stream ? 0 : devc->decoder.wire_channels;
+	/* A Buffer upload can start with up to 3 KiB left over from the previous
+	 * capture (seen after long captures, e.g. 1M samples at 2 MHz). Drop the
+	 * first 4 KiB; the device uploads more than requested, so the sample
+	 * count is unaffected. */
+	devc->skip_bytes = devc->stream ? 0 : BUFFER_SKIP_BYTES;
 	devc->channel_mask = mask;
 	devc->run_limit_samples = devc->continuous ? 0 : samples;
 	ret = prepare_transfers((struct sr_dev_inst *)sdi);
