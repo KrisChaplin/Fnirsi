@@ -34,6 +34,8 @@
 #define STOP_REPLY_SIZE 512
 #define STOP_REPLY_TIMEOUT_MS 250
 #define DATA_STALL_USEC (3 * G_TIME_SPAN_SECOND)
+/* Give up waiting for the end of a Buffer upload after this much silence. */
+#define UPLOAD_TAIL_USEC (200 * 1000)
 
 #include "transport-wch.h"
 
@@ -53,6 +55,7 @@ struct dev_context {
 	uint64_t samplerate;
 	int threshold;
 	gboolean stream, continuous, usb3, logic_only;
+	gboolean upload_tail;
 	struct pwm_setting pwm[4];
 	struct dla_decoder decoder;
 	uint32_t channel_mask;
@@ -809,6 +812,7 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	devc->stop_sent = FALSE;
 	devc->cancel_requested = FALSE;
 	devc->data_started = FALSE;
+	devc->upload_tail = FALSE;
 	if (devc->header_sent) {
 		devc->header_sent = FALSE;
 		ret = std_session_send_df_end(sdi);
@@ -864,6 +868,11 @@ static void check_data_progress(struct dev_context *devc)
 
 	if (devc->stopping || (!devc->data_started && devc->has_trigger))
 		return;
+	if (devc->upload_tail) {
+		if (g_get_monotonic_time() - devc->last_data_us > UPLOAD_TAIL_USEC)
+			request_stop(devc);
+		return;
+	}
 	timeout = devc->data_started ? DATA_STALL_USEC : devc->first_data_timeout_us;
 	if (g_get_monotonic_time() - devc->last_data_us <= timeout)
 		return;
@@ -949,7 +958,24 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	}
 	if (transfer->actual_length > 0) {
 		note_data_progress(devc);
-		decode_transfer(sdi, transfer->buffer, transfer->actual_length);
+		if (!devc->upload_tail)
+			decode_transfer(sdi, transfer->buffer, transfer->actual_length);
+	}
+	/* In Buffer mode the device uploads more than was requested and ends
+	 * the upload with a short packet. Read and discard the rest before STOP,
+	 * as the vendor application does; stopping mid-upload corrupts or
+	 * wedges later acquisitions.
+	 */
+	if (!devc->stopping && !devc->stream && devc->run_limit_samples &&
+			devc->limits.samples_read >= devc->run_limit_samples) {
+		devc->upload_tail = TRUE;
+		if (transfer->actual_length < transfer->length) {
+			request_stop(devc);
+			retire_transfer(transfer);
+			return;
+		}
+		resubmit_transfer(transfer);
+		return;
 	}
 	if (devc->stopping ||
 			(devc->run_limit_samples &&
@@ -1389,6 +1415,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->stopping = devc->stop_sent = devc->cancel_requested = FALSE;
 	devc->header_sent = FALSE;
 	devc->data_started = FALSE;
+	devc->upload_tail = FALSE;
 	devc->has_trigger = has_trigger;
 	first_data_msec = devc->stream ? 0 :
 		samples_to_milliseconds(samples, devc->samplerate);
