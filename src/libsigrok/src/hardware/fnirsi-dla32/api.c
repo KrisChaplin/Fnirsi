@@ -36,6 +36,7 @@
 #define STOP_SETTLE_USEC (800 * 1000)
 /* Delay between SETUP and ARM used by the vendor application. */
 #define SETUP_ARM_USEC (100 * 1000)
+#define SETUP_REPEAT_USEC (20 * 1000)
 #define STOP_REPLY_SIZE 512
 #define STOP_REPLY_TIMEOUT_MS 250
 #define DATA_STALL_USEC (3 * G_TIME_SPAN_SECOND)
@@ -1462,9 +1463,15 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	configure_setup(&setup, devc, samples, has_trigger);
 	dla_setup_configure(packet, &setup);
 	memcpy(devc->setup_cmd, packet, DLA_COMMAND_SIZE);
-	if (send_command(sdi, packet) != SR_OK) {
-		free_prepared_transfers(devc);
-		return SR_ERR_IO;
+	/* The device occasionally ignores a SETUP and keeps the previous
+	 * sample rate; sending it twice avoids that. */
+	for (i = 0; i < 2; i++) {
+		if (i)
+			g_usleep(SETUP_REPEAT_USEC);
+		if (send_command(sdi, packet) != SR_OK) {
+			free_prepared_transfers(devc);
+			return SR_ERR_IO;
+		}
 	}
 	g_usleep(SETUP_ARM_USEC);
 	devc->usb_ctx = ((struct drv_context *)sdi->driver->context)->sr_ctx;
