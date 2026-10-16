@@ -15,8 +15,11 @@
 #include "protocol.h"
 
 #define LOG_PREFIX "fnirsi-dla32"
-#define NUM_TRANSFERS 8
-#define TRANSFER_SIZE (1024 * 1024)
+/* The vendor application reads in 4 MiB transfers; eight 1 MiB transfers
+ * led to USB transfer errors that wedged the device on SuperSpeed. Linux
+ * limits usbfs buffers to 16 MiB per process by default, so queue three. */
+#define NUM_TRANSFERS 3
+#define TRANSFER_SIZE (4 * 1024 * 1024)
 #define TRANSFER_TIMEOUT_MS 1000
 #define USB_POLL_MS 10
 #define WCH_POLL_MS 1
@@ -40,6 +43,9 @@
 #define STOP_REPLY_SIZE 512
 #define STOP_REPLY_TIMEOUT_MS 250
 #define DATA_STALL_USEC (3 * G_TIME_SPAN_SECOND)
+/* Minimum silence before giving up on the end of a Buffer upload. */
+#define UPLOAD_TAIL_USEC (200 * 1000)
+#define BUFFER_SKIP_BYTES 4096
 
 #include "transport-wch.h"
 
@@ -59,6 +65,8 @@ struct dev_context {
 	uint64_t samplerate;
 	int threshold;
 	gboolean stream, continuous, usb3, logic_only;
+	gboolean upload_tail;
+	size_t skip_bytes;
 	gboolean have_history, last_stream;
 	struct pwm_setting pwm[4];
 	struct dla_decoder decoder;
@@ -818,6 +826,7 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	devc->stop_sent = FALSE;
 	devc->cancel_requested = FALSE;
 	devc->data_started = FALSE;
+	devc->upload_tail = FALSE;
 	if (devc->header_sent) {
 		devc->header_sent = FALSE;
 		ret = std_session_send_df_end(sdi);
@@ -873,6 +882,15 @@ static void check_data_progress(struct dev_context *devc)
 
 	if (devc->stopping || (!devc->data_started && devc->has_trigger))
 		return;
+	if (devc->upload_tail) {
+		/* At low rates the device uploads at roughly the sample rate, so
+		 * allow twice the time needed to fill one transfer. */
+		int64_t fill_us = (int64_t)(TRANSFER_SIZE * 8 / devc->decoder.wire_channels) *
+			G_USEC_PER_SEC / devc->samplerate;
+		if (g_get_monotonic_time() - devc->last_data_us > MAX(UPLOAD_TAIL_USEC, 2 * fill_us))
+			request_stop(devc);
+		return;
+	}
 	timeout = devc->data_started ? DATA_STALL_USEC : devc->first_data_timeout_us;
 	if (g_get_monotonic_time() - devc->last_data_us <= timeout)
 		return;
@@ -907,6 +925,15 @@ static uint64_t decode_transfer(struct sr_dev_inst *sdi,
 	uint64_t samples, remaining;
 	int ret;
 
+	if (devc->skip_bytes) {
+		size_t skip = MIN(devc->skip_bytes, length);
+
+		devc->skip_bytes -= skip;
+		input += skip;
+		length -= skip;
+		if (!length)
+			return 0;
+	}
 	if (dla_decode_feed(&devc->decoder, devc->wire_tail, &devc->pending,
 		devc->decoded, devc->decoded_size, input, length, &produced) < 0) {
 		sr_err("Invalid USB frame state or insufficient decode buffer.");
@@ -958,7 +985,24 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	}
 	if (transfer->actual_length > 0) {
 		note_data_progress(devc);
-		decode_transfer(sdi, transfer->buffer, transfer->actual_length);
+		if (!devc->upload_tail)
+			decode_transfer(sdi, transfer->buffer, transfer->actual_length);
+	}
+	/* In Buffer mode the device uploads more than was requested and ends
+	 * the upload with a short packet. Read and discard the rest before STOP,
+	 * as the vendor application does; stopping mid-upload corrupts or
+	 * wedges later acquisitions.
+	 */
+	if (!devc->stopping && !devc->stream && devc->run_limit_samples &&
+			devc->limits.samples_read >= devc->run_limit_samples) {
+		devc->upload_tail = TRUE;
+		if (transfer->actual_length < transfer->length) {
+			request_stop(devc);
+			retire_transfer(transfer);
+			return;
+		}
+		resubmit_transfer(transfer);
+		return;
 	}
 	if (devc->stopping ||
 			(devc->run_limit_samples &&
@@ -1340,6 +1384,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		return ret;
 	if (dla_decoder_init(&devc->decoder, mask, devc->stream) < 0)
 		return SR_ERR_ARG;
+	/* A Buffer upload can start with up to 3 KiB left over from the previous
+	 * capture (seen after long captures, e.g. 1M samples at 2 MHz). Drop the
+	 * first 4 KiB; the device uploads more than requested, so the sample
+	 * count is unaffected. */
+	devc->skip_bytes = devc->stream ? 0 : BUFFER_SKIP_BYTES;
 	devc->channel_mask = mask;
 	devc->run_limit_samples = devc->continuous ? 0 : samples;
 	ret = prepare_transfers((struct sr_dev_inst *)sdi);
@@ -1387,7 +1436,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	g_usleep(devc->have_history && devc->last_stream == devc->stream ?
 		STOP_SETTLE_USEC : MODE_SETTLE_USEC);
 
-	configure_setup(&setup, devc, samples, has_trigger);
+	/* In Buffer mode capture enough extra to cover the skipped lead-in,
+	 * so every delivered sample was actually captured. */
+	configure_setup(&setup, devc, devc->stream ? samples :
+		MIN(samples + BUFFER_SKIP_BYTES * 8 / devc->decoder.wire_channels,
+		maximum), has_trigger);
 	dla_setup_configure(packet, &setup);
 	/* The device occasionally ignores a SETUP and keeps the previous
 	 * sample rate; sending it twice avoids that. */
@@ -1405,6 +1458,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->stopping = devc->stop_sent = devc->cancel_requested = FALSE;
 	devc->header_sent = FALSE;
 	devc->data_started = FALSE;
+	devc->upload_tail = FALSE;
 	devc->has_trigger = has_trigger;
 	first_data_msec = devc->stream ? 0 :
 		samples_to_milliseconds(samples, devc->samplerate);
