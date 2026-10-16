@@ -58,6 +58,7 @@ struct dev_context {
 	int threshold;
 	gboolean stream, continuous, usb3, logic_only;
 	gboolean upload_tail;
+	size_t skip_bytes;
 	struct pwm_setting pwm[4];
 	struct dla_decoder decoder;
 	uint32_t channel_mask;
@@ -909,6 +910,15 @@ static uint64_t decode_transfer(struct sr_dev_inst *sdi,
 	uint64_t samples, remaining;
 	int ret;
 
+	if (devc->skip_bytes) {
+		size_t skip = MIN(devc->skip_bytes, length);
+
+		devc->skip_bytes -= skip;
+		input += skip;
+		length -= skip;
+		if (!length)
+			return 0;
+	}
 	if (dla_decode_feed(&devc->decoder, devc->wire_tail, &devc->pending,
 		devc->decoded, devc->decoded_size, input, length, &produced) < 0) {
 		sr_err("Invalid USB frame state or insufficient decode buffer.");
@@ -1359,6 +1369,9 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		return ret;
 	if (dla_decoder_init(&devc->decoder, mask, devc->stream) < 0)
 		return SR_ERR_ARG;
+	/* The first Buffer frame (8 samples per channel) can hold stale data,
+	 * seen reproducibly at 125 MHz. Drop it. */
+	devc->skip_bytes = devc->stream ? 0 : devc->decoder.wire_channels;
 	devc->channel_mask = mask;
 	devc->run_limit_samples = devc->continuous ? 0 : samples;
 	ret = prepare_transfers((struct sr_dev_inst *)sdi);
