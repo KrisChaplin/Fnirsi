@@ -83,5 +83,8 @@ SR_DLA32_PWM=1 sigrok-cli -d fnirsi-dla32:conn=4.11 -g PWM0 \
   delivered.
 - Level-trigger markers are placed at the expected position and may be off by
   a few hundred samples; edge-trigger markers are exact.
+- Continuous sampling keeps every sample in the frontend. At 50 MHz on 32
+  channels that is 200 MB/s, which PulseView cannot hold for long; use fewer
+  channels or a lower rate for continuous runs.
 - Linux limits usbfs buffers to 16 MiB per process by default; the driver
   uses three 4 MiB transfers to stay within it.
