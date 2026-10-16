@@ -15,8 +15,11 @@
 #include "protocol.h"
 
 #define LOG_PREFIX "fnirsi-dla32"
-#define NUM_TRANSFERS 8
-#define TRANSFER_SIZE (1024 * 1024)
+/* The vendor application reads in 4 MiB transfers; eight 1 MiB transfers
+ * led to USB transfer errors that wedged the device on SuperSpeed. Linux
+ * limits usbfs buffers to 16 MiB per process by default, so queue three. */
+#define NUM_TRANSFERS 3
+#define TRANSFER_SIZE (4 * 1024 * 1024)
 #define TRANSFER_TIMEOUT_MS 1000
 #define USB_POLL_MS 10
 #define WCH_POLL_MS 1
