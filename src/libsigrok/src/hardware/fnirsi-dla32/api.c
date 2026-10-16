@@ -27,8 +27,10 @@
 #define STOP_DRAIN_USEC (3 * G_TIME_SPAN_SECOND)
 #define STOP_DRAIN_BYTES (UINT64_C(64) * 1024 * 1024)
 #define STOP_EMPTY_READS 2
-/* The device ignores SETUP sent too soon after STOP (~30-60 ms observed). */
-#define STOP_SETTLE_USEC (100 * 1000)
+/* After STOP the device ignores a SETUP sent within ~60 ms, and a capture
+ * armed within ~400 ms may start with samples left over from the previous
+ * one (seen after sample rate changes). */
+#define STOP_SETTLE_USEC (800 * 1000)
 /* Delay between SETUP and ARM used by the vendor application. */
 #define SETUP_ARM_USEC (100 * 1000)
 #define STOP_REPLY_SIZE 512
